@@ -1,12 +1,14 @@
-name: Stock Scan (再次精股)
+name: Stock Scan (Direct Excel)
+
+# --- 关键：赋予写权限，允许创建 Release ---
+permissions:
+  contents: write
+
 on:
-  workflow_dispatch:        # 允许你手动点击运行
+  workflow_dispatch:
   schedule:
-    # 这里的设置决定了自动运行的时间
-    # GitHub 使用的是 UTC 时间 (比北京时间慢8小时)
-    # 我们想要：北京时间 18:30 (收盘后数据稳的时候)
-    # 换算为 UTC：18:30 - 8小时 = 10:30
-    - cron: '30 10 * * 1-5'
+    # 北京时间 17:00 (UTC 09:00)
+    - cron: '0 9 * * 1-5'
 
 jobs:
   run_scan:
@@ -15,23 +17,37 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
+      # 1. 获取当前日期 (为了给文件和标签命名)
+      - name: Get Date
+        id: date
+        run: echo "today=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
           
-      - name: Install Libs
+      - name: Install Dependencies
         run: |
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install akshare pandas numpy ta openpyxl requests tqdm scikit-learn
           
       - name: Run Script
         run: python main.py
         
-      - name: Upload Results
-        if: always()
-        uses: actions/upload-artifact@v4
+      # 2. 创建发布版并上传 Excel (不再是 Artifacts)
+      # 这里会自动把 .xlsx 文件挂载到 Release 页面
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        if: success()
         with:
-          name: Stock-Scan-Result
-          path: |
-            *.xlsx
-            *.txt
+          # 标签名，例如: Scan-20231027
+          tag_name: Scan-${{ steps.date.outputs.today }}
+          # 标题名
+          name: 选股结果 ${{ steps.date.outputs.today }}
+          # 上传所有 Excel 文件
+          files: "*.xlsx"
+          # 自动生成说明
+          body: "这是今日的自动选股结果，请点击下方 Excel 文件直接下载。"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
