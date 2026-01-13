@@ -12,6 +12,7 @@ import sys
 import traceback
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
+import concurrent.futures  # <--- 新增：多线程库
 
 # --- 1. 环境初始化 ---
 current_dir = os.getcwd()
@@ -25,37 +26,40 @@ def get_targets_robust():
         df = df[["代码", "名称"]]
         df.columns = ["code", "name"]
         targets = df[df["code"].str.startswith(("60", "00"))]
+        # 剔除 ST
         targets = targets[~targets['name'].str.contains('ST|退')]
         return targets, "方案A-东财"
     except:
         manual_list = [
-            ["600519", "贵州茅台"], ["002594", "比亚迪"], ["000858", "五粮液"],
+            ["600519", "贵州茅台"], ["002594", "比亚迪"], ["300750", "宁德时代"],
             ["601138", "工业富联"], ["600460", "士兰微"], ["000063", "中兴通讯"]
         ]
         return pd.DataFrame(manual_list, columns=["code", "name"]), "方案C-保底"
 
-# --- 3. 数据获取 ---
+# --- 3. 数据获取 (带简单的超时控制) ---
 def get_data_with_retry(code, start_date):
-    for i in range(3):
+    # 多线程模式下，重试次数不宜过多，否则会阻塞线程池
+    for i in range(2):
         try:
-            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust="qfq")
+            # timeout=5 设定超时，防止卡死
+            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust="qfq", timeout=10)
             if df is None or df.empty: raise ValueError("Empty")
             return df
         except:
             time.sleep(1)
     return None
 
-# --- 4. 核心计算 (妖股增强版) ---
-def process_stock(df):
+# --- 4. 核心计算 (妖股+机构+底吸) ---
+# 逻辑保持完全一致，只负责计算 DataFrame
+def process_stock_logic(df, code, name):
     # === A. 安全过滤 ===
     if len(df) < 120: return None
     close = df["close"]
     high = df["high"]
     low = df["low"]
-    open_p = df["open"]
     volume = df["volume"]
     
-    # 估算 VWAP (成本线)
+    # 估算 VWAP
     if "成交额" in df.columns:
         df["vwap"] = df["成交额"] / df["volume"]
     else:
@@ -71,21 +75,18 @@ def process_stock(df):
     df["MA20"] = close.rolling(20).mean()
     df["MA60"] = close.rolling(60).mean()
     
-    if close.iloc[-1] < df["MA60"].iloc[-1]: return None # 必须在年线之上
+    if close.iloc[-1] < df["MA60"].iloc[-1]: return None
 
     # === B. 指标计算 ===
-    # KDJ
     kdj = StochasticOscillator(high, low, close)
     df["K"] = kdj.stoch()
     df["D"] = kdj.stoch_signal()
     df["J"] = 3 * df["K"] - 2 * df["D"]
 
-    # MACD
     macd = MACD(close)
     df["DIF"] = macd.macd()
     df["DEA"] = macd.macd_signal()
     
-    # 机构指标
     adx_ind = ADXIndicator(high, low, close, window=14)
     df["ADX"] = adx_ind.adx()
     df["PDI"] = adx_ind.adx_pos()
@@ -112,58 +113,40 @@ def process_stock(df):
     signal_type = ""
     suggest_buy = 0.0
     stop_loss = 0.0
-    risk_warning = "" # 风险提示
 
-    # --- 策略组 1: 🐉 妖股战法 (增强版：防高位接盘) ---
+    # --- 策略组 1: 🐉 妖股战法 ---
     df["pct_chg"] = close.pct_change() * 100
     recent_30 = df.tail(30)
-    
-    # 1. 基因检测: 30天内有过涨停 (涨幅>9.5%)
     has_zt = (recent_30["pct_chg"] > 9.5).sum() >= 1
     
     if has_zt:
-        # 找到近期最高点的那一天
         peak_idx = recent_30["high"].idxmax()
         peak_date_row = df.loc[peak_idx]
-        
-        # --- 🔥 过滤器 A: 见顶形态过滤 (Tombstone Check) ---
-        # 如果最高点那天是"巨量长上影" (上影线>3% 且 阴线/假阴线)，视为出货，不买
         peak_upper_shadow = (peak_date_row["high"] - max(peak_date_row["open"], peak_date_row["close"])) / peak_date_row["close"]
         is_bad_peak = peak_upper_shadow > 0.03 and peak_date_row["volume"] > recent_30["volume"].mean() * 2
         
         if not is_bad_peak:
-            # 2. 回调状态确认
-            # 价格在 MA20 之上 (生命线)
             if curr["close"] > curr["MA20"]:
-                # 回踩幅度: 距离 MA10 或 MA20 很近 (<2%)
                 dist_ma10 = abs(curr["close"] - curr["MA10"]) / curr["MA10"]
                 dist_ma20 = abs(curr["close"] - curr["MA20"]) / curr["MA20"]
                 
                 if dist_ma10 < 0.025 or dist_ma20 < 0.025:
-                    
-                    # --- 🔥 过滤器 B: 缩量确认 (Volume Shrinkage) ---
-                    # 今天的成交量，必须小于近期最大成交量的 60% (缩量才安全)
                     max_vol = recent_30["volume"].max()
                     if curr["volume"] < max_vol * 0.6:
-                        
-                        # --- 🔥 过滤器 C: 换手率风控 ---
-                        # 如果有换手率数据，且今日换手率 > 15%，说明分歧太大，不买
                         safe_turnover = True
-                        if "换手率" in df.columns and curr["换手率"] > 15:
-                            safe_turnover = False
+                        if "换手率" in df.columns and curr["换手率"] > 15: safe_turnover = False
                         
                         if safe_turnover:
-                            # 判定成功
                             if dist_ma10 < 0.025:
                                 signal_type = "🐉龙回头(踩10日线)"
                                 suggest_buy = round(curr["MA10"], 2)
-                                stop_loss = round(curr["MA10"] * 0.95, 2) # 强势股止损要快
+                                stop_loss = round(curr["MA10"] * 0.95, 2)
                             else:
                                 signal_type = "🐉龙回头(踩20日线)"
                                 suggest_buy = round(curr["MA20"], 2)
                                 stop_loss = round(curr["MA20"] * 0.97, 2)
 
-    # --- 策略组 2: 👑 机构趋势 (保持不变) ---
+    # --- 策略组 2: 👑 机构趋势 ---
     if not signal_type:
         if curr["ADX"] > 25 and curr["PDI"] > curr["MDI"] and curr["close"] > curr["vwap"] and curr["MFI"] < 85:
             if (curr["ADX"] > prev["ADX"]) and (curr["CCI"] > 100):
@@ -171,15 +154,15 @@ def process_stock(df):
                 suggest_buy = round(curr["vwap"], 2)
                 stop_loss = round(curr["MA20"], 2)
 
-    # --- 策略组 3: 🟢 极品底吸 (保持不变) ---
+    # --- 策略组 3: 🟢 极品底吸 ---
     if not signal_type:
-        # J值反击
+        # J值
         was_oversold = (prev["J"] < 0) or (df.iloc[-3]["J"] < 0)
         if was_oversold and curr["close"] > curr["open"] and curr["J"] > prev["J"]:
             signal_type = "🟢J值超卖反击"
             suggest_buy = round(curr["close"], 2)
             stop_loss = round(curr["low"] * 0.98, 2)
-        # 金针探底
+        # 金针
         elif (min(curr["open"], curr["close"]) - curr["low"] > abs(curr["open"] - curr["close"]) * 2) and (curr["low"] < curr["MA20"]):
             signal_type = "🟢金针探底"
             suggest_buy = round(curr["low"] + (min(curr["open"], curr["close"]) - curr["low"])*0.5, 2)
@@ -191,23 +174,48 @@ def process_stock(df):
             stop_loss = round(curr["MA60"] * 0.98, 2)
 
     if not signal_type: return None
-    
-    # 全局OBV过滤
     if curr["OBV"] < df["OBV"].tail(20).mean() * 0.9: return None
 
     return {
-        "code": df.name,
-        "name": "", 
-        "close": curr["close"],
-        "signal_type": signal_type,
-        "buy_price": suggest_buy,   
-        "stop_loss": stop_loss,
-        "adx": round(curr["ADX"], 1),
-        "j_val": round(curr["J"], 1),
-        "vol_ratio": round(volume.iloc[-1] / df["volume"].rolling(5).mean().iloc[-1], 2) if df["volume"].rolling(5).mean().iloc[-1] != 0 else 0
+        "代码": code,
+        "名称": name,
+        "现价": curr["close"],
+        "信号类型": signal_type,
+        "建议挂单": suggest_buy,
+        "止损价": stop_loss,
+        "ADX": round(curr["ADX"], 1),
+        "J值": round(curr["J"], 1),
+        "量比": round(volume.iloc[-1] / df["volume"].rolling(5).mean().iloc[-1], 2) if df["volume"].rolling(5).mean().iloc[-1] != 0 else 0
     }
 
-# --- 5. 美化 Excel ---
+# --- 5. 多线程包装函数 ---
+def analyze_one_stock(code, name, start_dt):
+    """
+    单个股票的处理入口，包含数据获取和逻辑计算
+    """
+    try:
+        # 获取数据
+        df = get_data_with_retry(code, start_dt)
+        if df is None: return None
+
+        # 清洗数据
+        rename_dict = {
+            "日期":"date","开盘":"open","收盘":"close",
+            "最高":"high","最低":"low","成交量":"volume",
+            "成交额":"amount", "换手率":"turnover"
+        }
+        # 动态重命名，防止接口列名变化报错
+        col_map = {k:v for k,v in rename_dict.items() if k in df.columns}
+        df.rename(columns=col_map, inplace=True)
+        df["date"] = pd.to_datetime(df["date"])
+        df.set_index("date", inplace=True)
+
+        # 调用核心逻辑
+        return process_stock_logic(df, code, name)
+    except:
+        return None
+
+# --- 6. 美化 Excel ---
 def add_guide_to_excel(filename, data_len):
     try:
         wb = openpyxl.load_workbook(filename)
@@ -217,111 +225,94 @@ def add_guide_to_excel(filename, data_len):
         red_font = Font(name='微软雅黑', size=10, bold=True, color="FF0000")
         
         start_row = data_len + 4
-        ws.cell(row=start_row, column=1, value="📘 增强版操作指南 (防站岗)").font = Font(size=12, bold=True, color="0000FF")
-        start_row += 1
+        ws.cell(row=start_row, column=1, value="📘 增强版操作指南 (多线程极速版)").font = Font(size=12, bold=True, color="0000FF")
         
         guides = [
-            ("【🐉 妖股战法 - 安全增强】", ""),
-            ("1. 策略逻辑", "只做有过涨停基因，且缩量回调到均线支撑的票。"),
-            ("2. 防高位站岗", "已自动剔除：高位放量长上影(墓碑线)、换手率>15%的出货盘。"),
-            ("3. 挂单技巧", "请严格在'建议挂单价'埋伏，不成交不追高。"),
-            ("", ""),
-            ("【👑 机构趋势】", "ADX>25 强趋势，沿成本线买入，适合中线。"),
-            ("【🟢 极品底吸】", "左侧博反弹，必须设好止损，快进快出。"),
-            ("", ""),
-            ("【⚠️ 铁律】", "跌破'止损价'，无论理由，坚决卖出！")
+            ("【🐉 妖股战法】", "缩量回踩10日/20日线。建议挂单低吸，不追高。"),
+            ("【👑 机构趋势】", "ADX强趋势。沿成本线买入，适合波段持有。"),
+            ("【🟢 极品底吸】", "左侧博反弹。严格按止损价操作，快进快出。"),
+            ("【⚠️ 风险提示】", "跌破止损价必须无条件卖出！")
         ]
         
         for i, (title, desc) in enumerate(guides):
-            ws.cell(row=start_row + i, column=1, value=title).font = Font(bold=True)
-            ws.cell(row=start_row + i, column=2, value=desc).font = text_font
-            if "防" in title or "铁律" in title: ws.cell(row=start_row + i, column=2).font = red_font
+            curr_r = start_row + 1 + i
+            ws.cell(row=curr_r, column=1, value=title).font = Font(bold=True)
+            ws.cell(row=curr_r, column=2, value=desc).font = text_font
+            if "风险" in title: ws.cell(row=curr_r, column=2).font = red_font
 
         wb.save(filename)
     except: pass
-# --- 6. 主程序 ---
+
+# --- 7. 主程序 ---
 def main():
-    print("=== 全功能增强版 (防高位站岗) ===")
-    pd.DataFrame([["Init", "OK"]]).to_excel("Init_Check.xlsx", index=False)
+    print("=== 全功能多线程极速版启动 ===")
+    
+    # 加上时间戳防止文件冲突
+    ts = datetime.now().strftime("%H%M")
+    pd.DataFrame([["Init", "OK"]]).to_excel(f"Init_Check_{ts}.xlsx", index=False)
     
     try:
         targets, source_name = get_targets_robust()
         
-        start_dt = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
+        # 为了计算 MA60，至少需要过去 120 天数据
+        start_dt = (datetime.now() - timedelta(days=150)).strftime("%Y%m%d")
         result_data = []
         
         total = len(targets)
-        print(f"开始扫描 {total} 只股票...")
+        print(f"待扫描股票: {total} 只 | 来源: {source_name}")
+        print("🚀 启动 4 线程并发扫描 (请耐心等待约 10-15 分钟)...")
 
-        for i, s in targets.iterrows():
-            code = s["code"]
-            name = s["name"]
+        # --- 核心：多线程处理 ---
+        # max_workers=4 是 GitHub Actions 的安全并发数，太高容易被封 IP
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            # 提交所有任务
+            future_to_stock = {
+                executor.submit(analyze_one_stock, row['code'], row['name'], start_dt): row['code']
+                for _, row in targets.iterrows()
+            }
             
-            if i % 20 == 0: print(f"进度: {i}/{total} ...")
-
-            try:
-                df = get_data_with_retry(code, start_dt)
-                if df is None: continue
-
-                rename_dict = {
-                    "日期":"date","开盘":"open","收盘":"close",
-                    "最高":"high","最低":"low","成交量":"volume",
-                    "成交额":"amount", "换手率":"turnover"
-                }
-                col_map = {k:v for k,v in rename_dict.items() if k in df.columns}
-                df.rename(columns=col_map, inplace=True)
-                df["date"] = pd.to_datetime(df["date"])
-                df.set_index("date", inplace=True)
-                df.name = code
-
-                res = process_stock(df)
+            # 处理结果 (带进度显示)
+            count = 0
+            for future in concurrent.futures.as_completed(future_to_stock):
+                count += 1
+                if count % 100 == 0:
+                    print(f"进度: {count}/{total} ...")
                 
-                if res:
-                    print(f"  ★ {res['signal_type']}: {code} {name}")
-                    result_data.append({
-                        "代码": code,
-                        "名称": name,
-                        "现价": res["close"],
-                        "信号类型": res["signal_type"], 
-                        "建议挂单": res["buy_price"],  
-                        "止损价": res["stop_loss"],
-                        "ADX": res["adx"],
-                        "J值": res["j_val"],
-                        "量比": res["vol_ratio"]
-                    })
-            except: continue
-            time.sleep(0.05)
+                try:
+                    res = future.result()
+                    if res:
+                        print(f"  ★ 发现: {res['名称']} [{res['信号类型']}]")
+                        result_data.append(res)
+                except:
+                    pass
 
-        dt_str = datetime.now().strftime("%Y%m%d")
+        # 保存结果
+        dt_str = datetime.now().strftime("%Y%m%d_%H%M") # 精确到分钟
+        
         if result_data:
             df_res = pd.DataFrame(result_data)
+            # 排序：妖股 -> 机构 -> 底吸
             df_res = df_res.sort_values(by=["信号类型"], ascending=False)
-            filename = f"全策略精选_{dt_str}.xlsx"
+            
+            filename = f"极速精选_{dt_str}.xlsx"
             df_res.to_excel(filename, index=False)
             add_guide_to_excel(filename, len(df_res))
-            print(f"完成！已保存: {filename}")
+            print(f"✅ 完成！结果已保存: {filename}")
         else:
+            print("今日无符合条件的股票。")
             pd.DataFrame([["无"]]).to_excel(f"无结果_{dt_str}.xlsx")
 
     except Exception:
-        # 发生严重错误时，写入 txt，这样 run.yml 也能上传它
+        # 严重错误记录
         err = traceback.format_exc()
         print(f"FATAL ERROR: {err}")
-        with open("FATAL_ERROR.txt", "w") as f:
-            f.write(err)
+        with open("FATAL_ERROR.txt", "w") as f: f.write(err)
 
-    # 确保无论如何都有 Excel 生成（防止 Release 为空）
-    # 检查当前目录下是否有 xlsx 文件
-    has_excel = False
-    for fname in os.listdir("."):
-        if fname.endswith(".xlsx"):
-            has_excel = True
-            break
-    
-    if not has_excel:
-        # 如果没生成过 Excel，强制生成一个空的
-        dt_str = datetime.now().strftime("%Y%m%d")
-        pd.DataFrame([["无结果", "可能是没选出股票，也可能是出错了，请看日志"]]).to_excel(f"强制保底_{dt_str}.xlsx", index=False)
+    # 强制保底文件 (防止 Action 找不到文件报错)
+    # 检查目录下是否有 xlsx
+    has_xlsx = any(f.endswith('.xlsx') for f in os.listdir('.'))
+    if not has_xlsx:
+        pd.DataFrame([["无结果"]]).to_excel(f"强制保底_{dt_str}.xlsx", index=False)
 
 if __name__ == "__main__":
     main()
