@@ -1,4 +1,4 @@
-name: Stock Scan with RSI (更严格)
+name: Stock Scan with (加机构)
 
 on:
   workflow_dispatch:        # 允许你手动点击运行
