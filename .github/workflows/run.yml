@@ -1,13 +1,11 @@
 name: Stock Scan (Direct Excel)
 
-# --- 关键：赋予写权限，允许创建 Release ---
 permissions:
   contents: write
 
 on:
   workflow_dispatch:
   schedule:
-    # 北京时间 17:00 (UTC 09:00)
     - cron: '0 9 * * 1-5'
 
 jobs:
@@ -17,7 +15,6 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
-      # 1. 获取当前日期 (为了给文件和标签命名)
       - name: Get Date
         id: date
         run: echo "today=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
@@ -35,19 +32,22 @@ jobs:
       - name: Run Script
         run: python main.py
         
-      # 2. 创建发布版并上传 Excel (不再是 Artifacts)
-      # 这里会自动把 .xlsx 文件挂载到 Release 页面
+      # --- 新增调试步骤：列出所有文件 ---
+      # 这样在日志里能看到到底生成了什么
+      - name: Check Files
+        run: ls -R
+        
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
-        if: success()
+        # 修改为 always()，即使脚本报错，只要生成了日志也上传
+        if: always() 
         with:
-          # 标签名，例如: Scan-20231027
           tag_name: Scan-${{ steps.date.outputs.today }}
-          # 标题名
           name: 选股结果 ${{ steps.date.outputs.today }}
-          # 上传所有 Excel 文件
-          files: "*.xlsx"
-          # 自动生成说明
-          body: "这是今日的自动选股结果，请点击下方 Excel 文件直接下载。"
+          # 关键修改：同时上传 xlsx 和 txt (错误日志)
+          files: |
+            *.xlsx
+            *.txt
+          body: "请查看下方 Attachments 下载结果。如果是 txt 文件，说明运行出错了。"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
