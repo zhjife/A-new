@@ -48,9 +48,8 @@ def get_data_with_retry(code, start_date):
         except:
             time.sleep(1)
     return None
-
-# --- 4. 核心计算 (妖股+机构+底吸) ---
-# 逻辑保持完全一致，只负责计算 DataFrame
+    
+# --- 4. 核心计算 (妖股+机构+底吸 + OBV资金流向) ---
 def process_stock_logic(df, code, name):
     # === A. 安全过滤 ===
     if len(df) < 120: return None
@@ -65,9 +64,11 @@ def process_stock_logic(df, code, name):
     else:
         df["vwap"] = (high + low + close) / 3
 
-    # 僵尸股 & 低价股
+    # 1. 放宽成交额限制：2500万
     amount = df["成交额"].iloc[-1] if "成交额" in df.columns else close.iloc[-1] * volume.iloc[-1]
-    if amount < 50000000: return None
+    if amount < 25000000: return None 
+    
+    # 2. 价格底线
     if close.iloc[-1] < 3.0: return None
     
     df["MA5"] = close.rolling(5).mean()
@@ -75,17 +76,14 @@ def process_stock_logic(df, code, name):
     df["MA20"] = close.rolling(20).mean()
     df["MA60"] = close.rolling(60).mean()
     
-    if close.iloc[-1] < df["MA60"].iloc[-1]: return None
-
     # === B. 指标计算 ===
-    kdj = StochasticOscillator(high, low, close)
+    kdj = StochasticOscillator(high, low, close, window=9, smooth_window=3)
     df["K"] = kdj.stoch()
     df["D"] = kdj.stoch_signal()
     df["J"] = 3 * df["K"] - 2 * df["D"]
 
     macd = MACD(close)
     df["DIF"] = macd.macd()
-    df["DEA"] = macd.macd_signal()
     
     adx_ind = ADXIndicator(high, low, close, window=14)
     df["ADX"] = adx_ind.adx()
@@ -98,8 +96,10 @@ def process_stock_logic(df, code, name):
     cci_ind = CCIIndicator(high, low, close, window=14)
     df["CCI"] = cci_ind.cci()
     
+    # --- OBV 资金流向计算 ---
     obv_ind = OnBalanceVolumeIndicator(close, volume)
     df["OBV"] = obv_ind.on_balance_volume()
+    df["OBV_MA5"] = df["OBV"].rolling(5).mean()
     df["OBV_MA10"] = df["OBV"].rolling(10).mean()
 
     # 切片
@@ -107,8 +107,17 @@ def process_stock_logic(df, code, name):
     prev = df.iloc[-2]
     if pd.isna(curr['ADX']): return None
 
+    # 计算 OBV 状态
+    obv_status = "资金流出" # 默认
+    if curr["OBV"] > curr["OBV_MA5"] and curr["OBV_MA5"] > curr["OBV_MA10"]:
+        obv_status = "🔴资金持续流入"
+    elif curr["OBV"] > curr["OBV_MA10"]:
+        obv_status = "🟠资金流入"
+    else:
+        obv_status = "🟢资金流出"
+
     # ==========================================
-    # 🕵️‍♀️ 策略逻辑
+    # 🕵️‍♀️ 策略逻辑 (优化版)
     # ==========================================
     signal_type = ""
     suggest_buy = 0.0
@@ -120,73 +129,68 @@ def process_stock_logic(df, code, name):
     has_zt = (recent_30["pct_chg"] > 9.5).sum() >= 1
     
     if has_zt:
-        peak_idx = recent_30["high"].idxmax()
-        peak_date_row = df.loc[peak_idx]
-        peak_upper_shadow = (peak_date_row["high"] - max(peak_date_row["open"], peak_date_row["close"])) / peak_date_row["close"]
-        is_bad_peak = peak_upper_shadow > 0.03 and peak_date_row["volume"] > recent_30["volume"].mean() * 2
-        
-        if not is_bad_peak:
-            if curr["close"] > curr["MA20"]:
-                dist_ma10 = abs(curr["close"] - curr["MA10"]) / curr["MA10"]
-                dist_ma20 = abs(curr["close"] - curr["MA20"]) / curr["MA20"]
-                
-                if dist_ma10 < 0.025 or dist_ma20 < 0.025:
-                    max_vol = recent_30["volume"].max()
-                    if curr["volume"] < max_vol * 0.6:
-                        safe_turnover = True
-                        if "换手率" in df.columns and curr["换手率"] > 15: safe_turnover = False
-                        
-                        if safe_turnover:
-                            if dist_ma10 < 0.025:
-                                signal_type = "🐉龙回头(踩10日线)"
-                                suggest_buy = round(curr["MA10"], 2)
-                                stop_loss = round(curr["MA10"] * 0.95, 2)
-                            else:
-                                signal_type = "🐉龙回头(踩20日线)"
-                                suggest_buy = round(curr["MA20"], 2)
-                                stop_loss = round(curr["MA20"] * 0.97, 2)
+        if curr["close"] > curr["MA20"]:
+            dist_ma10 = abs(curr["close"] - curr["MA10"]) / curr["MA10"]
+            dist_ma20 = abs(curr["close"] - curr["MA20"]) / curr["MA20"]
+            
+            if dist_ma10 < 0.04 or dist_ma20 < 0.04:
+                max_vol = recent_30["volume"].max()
+                if curr["volume"] < max_vol * 0.6:
+                    if dist_ma10 < 0.04:
+                        signal_type = "🐉龙回头(踩10日线)"
+                        suggest_buy = round(curr["MA10"], 2)
+                        stop_loss = round(curr["MA10"] * 0.95, 2)
+                    else:
+                        signal_type = "🐉龙回头(踩20日线)"
+                        suggest_buy = round(curr["MA20"], 2)
+                        stop_loss = round(curr["MA20"] * 0.95, 2)
 
     # --- 策略组 2: 👑 机构趋势 ---
     if not signal_type:
-        if curr["ADX"] > 25 and curr["PDI"] > curr["MDI"] and curr["close"] > curr["vwap"] and curr["MFI"] < 85:
-            if (curr["ADX"] > prev["ADX"]) and (curr["CCI"] > 100):
-                signal_type = "👑机构主升浪"
-                suggest_buy = round(curr["vwap"], 2)
-                stop_loss = round(curr["MA20"], 2)
+        # ADX > 20, 趋势向上, 且必须是资金流入状态才算机构票
+        if curr["ADX"] > 20 and curr["PDI"] > curr["MDI"] and curr["close"] > curr["MA20"]:
+            # 机构票最好要求资金至少是流入状态
+            if (curr["ADX"] >= prev["ADX"]) and (curr["CCI"] > 50) and (curr["MFI"] < 85):
+                 # 如果是流出状态，可能在出货，过滤掉
+                if "流出" not in obv_status: 
+                    signal_type = "👑机构主升浪"
+                    suggest_buy = round(curr["vwap"], 2)
+                    stop_loss = round(curr["MA20"] * 0.98, 2)
 
     # --- 策略组 3: 🟢 极品底吸 ---
     if not signal_type:
-        # J值
-        was_oversold = (prev["J"] < 0) or (df.iloc[-3]["J"] < 0)
-        if was_oversold and curr["close"] > curr["open"] and curr["J"] > prev["J"]:
+        was_oversold = (prev["J"] < 10) or (df.iloc[-3]["J"] < 10)
+        
+        if was_oversold and curr["J"] > prev["J"] and curr["close"] > curr["open"]:
             signal_type = "🟢J值超卖反击"
             suggest_buy = round(curr["close"], 2)
             stop_loss = round(curr["low"] * 0.98, 2)
-        # 金针
-        elif (min(curr["open"], curr["close"]) - curr["low"] > abs(curr["open"] - curr["close"]) * 2) and (curr["low"] < curr["MA20"]):
+            
+        elif (min(curr["open"], curr["close"]) - curr["low"] > abs(curr["open"] - curr["close"]) * 1.5) and (curr["low"] < curr["MA20"]):
             signal_type = "🟢金针探底"
-            suggest_buy = round(curr["low"] + (min(curr["open"], curr["close"]) - curr["low"])*0.5, 2)
+            suggest_buy = round(curr["low"] * 1.01, 2)
             stop_loss = round(curr["low"] * 0.99, 2)
-        # 生命线
-        elif abs(curr["low"] - curr["MA60"])/curr["MA60"] < 0.015 and curr["close"] > curr["MA60"]:
+            
+        elif abs(curr["low"] - curr["MA60"])/curr["MA60"] < 0.02 and curr["close"] > curr["MA60"]:
             signal_type = "🟢生命线(MA60)回踩"
             suggest_buy = round(curr["MA60"], 2)
             stop_loss = round(curr["MA60"] * 0.98, 2)
 
     if not signal_type: return None
-    if curr["OBV"] < df["OBV"].tail(20).mean() * 0.9: return None
 
     return {
         "代码": code,
         "名称": name,
         "现价": curr["close"],
         "信号类型": signal_type,
+        "资金流向": obv_status,  # <--- 新增列
         "建议挂单": suggest_buy,
         "止损价": stop_loss,
         "ADX": round(curr["ADX"], 1),
         "J值": round(curr["J"], 1),
         "量比": round(volume.iloc[-1] / df["volume"].rolling(5).mean().iloc[-1], 2) if df["volume"].rolling(5).mean().iloc[-1] != 0 else 0
     }
+
 
 # --- 5. 多线程包装函数 ---
 def analyze_one_stock(code, name, start_dt):
