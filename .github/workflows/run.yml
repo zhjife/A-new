@@ -1,13 +1,13 @@
-name: Stock Scan (Direct Excel)
-
-permissions:
-  contents: write
+name: Stock Scan with RSI (更严格)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:        # 允许你手动点击运行
   schedule:
+    # 这里的设置决定了自动运行的时间
+    # GitHub 使用的是 UTC 时间 (比北京时间慢8小时)
+    # 我们想要：北京时间 18:30 (收盘后数据稳的时候)
+    # 换算为 UTC：18:30 - 8小时 = 10:30
     - cron: '0 9 * * 1-5'
-
 jobs:
   run_scan:
     runs-on: ubuntu-latest
@@ -15,39 +15,23 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
-      - name: Get Date
-        id: date
-        run: echo "today=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
           
-      - name: Install Dependencies
+      - name: Install Libs
         run: |
-          python -m pip install --upgrade pip
-          pip install akshare pandas numpy ta openpyxl requests tqdm scikit-learn
+          pip install -r requirements.txt
           
       - name: Run Script
         run: python main.py
         
-      # --- 新增调试步骤：列出所有文件 ---
-      # 这样在日志里能看到到底生成了什么
-      - name: Check Files
-        run: ls -R
-        
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v1
-        # 修改为 always()，即使脚本报错，只要生成了日志也上传
-        if: always() 
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: Scan-${{ steps.date.outputs.today }}
-          name: 选股结果 ${{ steps.date.outputs.today }}
-          # 关键修改：同时上传 xlsx 和 txt (错误日志)
-          files: |
+          name: Stock-Scan-Result
+          path: |
             *.xlsx
             *.txt
-          body: "请查看下方 Attachments 下载结果。如果是 txt 文件，说明运行出错了。"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
