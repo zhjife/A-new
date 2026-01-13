@@ -1,1 +1,7 @@
-
+akshare>=1.12.0
+pandas
+numpy
+ta
+openpyxl
+requests
+tqdm
