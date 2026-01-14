@@ -13,17 +13,17 @@ import traceback
 import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill
 import concurrent.futures
-import random  # <--- 新增随机库
+import random
 
 # --- 1. 环境与配置 ---
 current_dir = os.getcwd()
 sys.path.append(current_dir)
 
 CONFIG = {
-    "MIN_AMOUNT": 20000000,   # 最低成交额
-    "MIN_PRICE": 2.5,         # 最低股价
-    "MAX_WORKERS": 12,        # 🔥 [安全修正] 改为12线程 (兼顾速度与防封)
-    "DAYS_LOOKBACK": 150      # 数据回溯
+    "MIN_AMOUNT": 10000000,   # 🔥 降级：门槛降回1000万，防止误杀
+    "MIN_PRICE": 2.0,         # 🔥 降级：门槛降回2元
+    "MAX_WORKERS": 8,         # 8线程比较稳
+    "DAYS_LOOKBACK": 150
 }
 
 HOT_CONCEPTS = [] 
@@ -31,7 +31,7 @@ HISTORY_FILE = "history_log.csv"
 
 # --- 2. 宏观与基础数据 ---
 def get_market_hot_spots():
-    print(">>> [0/4] 扫描今日热门题材与政策导向...")
+    print(">>> [0/4] 扫描今日热门题材...")
     global HOT_CONCEPTS
     try:
         df = ak.stock_board_concept_name_em()
@@ -42,53 +42,68 @@ def get_market_hot_spots():
         HOT_CONCEPTS = []
 
 def get_targets_robust():
-    """
-    🔥 [提速核心]：利用实时数据[强力预过滤]，减少50%以上的无效HTTP请求
-    """
-    print(">>> [1/4] 获取A股全市场股票列表并进行[预过滤]...")
+    print(">>> [1/4] 获取股票列表并进行[强力清洗]...")
     try:
-        # 获取实时行情
         df = ak.stock_zh_a_spot_em()
         
-        # 1. 基础过滤
-        df = df[df["代码"].str.startswith(("60", "00"))]
-        df = df[~df['名称'].str.contains('ST|退')]
+        # 🔥 1. 列名兼容性处理 (防止接口变动)
+        # 很多时候是这里出了问题导致一列找不到
+        col_map = {
+            "最新价": "price", "最新价格": "price", 
+            "成交额": "amount", "成交金额": "amount",
+            "代码": "code", "名称": "name"
+        }
+        df.rename(columns=col_map, inplace=True)
         
-        # 2. 🔥 预过滤：价格 (直接剔除低价股，不再请求历史数据)
-        df = df[df["最新价"] >= CONFIG["MIN_PRICE"]]
+        # 🔥 2. 强制类型转换 (防止全是字符串无法比较)
+        df["price"] = pd.to_numeric(df["price"], errors='coerce')
+        df["amount"] = pd.to_numeric(df["amount"], errors='coerce')
         
-        # 3. 🔥 预过滤：成交额 (剔除僵尸股)
-        # 此时如果是盘中，成交额是动态的；如果是盘后，是全天的。
-        # 只要成交额极低(例如<500万)，说明今天全天没戏，直接剔除。
-        df = df[df["成交额"] > 5000000] 
-
-        targets = df[["代码", "名称"]]
-        targets.columns = ["code", "name"]
+        # 3. 剔除无效数据
+        df.dropna(subset=["price", "amount"], inplace=True)
         
-        print(f"✅ 预过滤完成：有效活跃标的 {len(targets)} 只 (已剔除 {5000-len(targets)} 只垃圾股)")
+        # 4. 基础过滤
+        df = df[df["code"].str.startswith(("60", "00"))]
+        df = df[~df['name'].str.contains('ST|退')]
+        
+        # 记录过滤前数量
+        raw_len = len(df)
+        
+        # 5. 门槛过滤
+        df = df[df["price"] >= CONFIG["MIN_PRICE"]]
+        # 这里特别注意：如果是在早盘刚开盘，成交额可能很小，不要设太高
+        df = df[df["amount"] > CONFIG["MIN_AMOUNT"]] 
+        
+        targets = df[["code", "name"]]
+        print(f"✅ 数据清洗完成: 原始 {raw_len} -> 有效 {len(targets)} 只")
+        
+        if len(targets) == 0:
+            print("❌ 警告：预过滤后数量为0！可能是akshare接口数据异常。")
+            # 启动保底逻辑
+            raise ValueError("Filtered to zero")
+            
         return targets, "在线API"
+        
     except Exception as e:
-        print(f"⚠️ 预过滤失败，使用保底列表: {e}")
-        manual_list = [["600519", "贵州茅台"], ["002594", "比亚迪"]]
+        print(f"⚠️ API数据异常: {e}，启动保底测试列表...")
+        manual_list = [
+            ["600519", "贵州茅台"], ["002594", "比亚迪"], ["601138", "工业富联"],
+            ["000063", "中兴通讯"], ["600460", "士兰微"], ["300750", "宁德时代"]
+        ]
         return pd.DataFrame(manual_list, columns=["code", "name"]), "保底列表"
 
 def get_data_with_retry(code, start_date):
-    # 🔥 [防封核心]：每次请求前随机休眠 0.05~0.2秒
-    # 这会稍微降低速度，但能极大降低 IP 被封概率
-    time.sleep(random.uniform(0.05, 0.2)) 
-    
+    time.sleep(random.uniform(0.05, 0.15))
     for _ in range(2):
         try:
             df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust="qfq", timeout=5)
             if df is None or df.empty: raise ValueError("Empty")
             return df
-        except: 
-            time.sleep(0.5) # 出错多睡一会
+        except: time.sleep(0.5)
     return None
 
 def get_stock_catalysts(code):
     try:
-        # 新闻接口请求量小，且只针对入选股，风险较低
         news_df = ak.stock_news_em(symbol=code)
         if not news_df.empty:
             title = news_df.iloc[0]['新闻标题']
@@ -97,9 +112,9 @@ def get_stock_catalysts(code):
     except: pass
     return "无近期新闻"
 
-# --- 3. 核心逻辑 (逻辑不变) ---
+# --- 3. 核心逻辑 (逻辑放宽，保证出结果) ---
 def process_stock_logic(df, code, name):
-    if len(df) < 120: return None
+    if len(df) < 60: return None # 放宽K线长度限制
     
     rename_dict = {"日期":"date","开盘":"open","收盘":"close","最高":"high","最低":"low","成交量":"volume","成交额":"amount"}
     col_map = {k:v for k,v in rename_dict.items() if k in df.columns}
@@ -111,10 +126,6 @@ def process_stock_logic(df, code, name):
     volume = df["volume"]
     df["vwap"] = df["amount"] / volume if "amount" in df.columns else (high + low + close) / 3
 
-    # 二次门槛确认
-    curr_amount = df["amount"].iloc[-1] if "amount" in df.columns else (close.iloc[-1] * volume.iloc[-1])
-    if curr_amount < CONFIG["MIN_AMOUNT"]: return None
-    
     # 指标计算
     df["pct_chg"] = close.pct_change() * 100
     today_pct = df["pct_chg"].iloc[-1]
@@ -159,42 +170,41 @@ def process_stock_logic(df, code, name):
     high_120 = df["high"].tail(120).max()
     low_120 = df["low"].tail(120).min()
     current_pos = (curr["close"] - low_120) / (high_120 - low_120 + 0.001)
-    if current_pos < 0.35:
+    if current_pos < 0.4: # 放宽位置限制
         volatility = df["close"].tail(60).std() / df["close"].tail(60).mean()
-        if volatility < 0.1: chip_signal = "🏆低位单峰密集" 
+        if volatility < 0.15: chip_signal = "🏆筹码密集" 
 
     patterns = []
+    # 红肥绿瘦 (放宽比例)
     recent_20 = df.tail(20)
     vol_up = recent_20[recent_20['close'] > recent_20['open']]['volume'].sum()
     vol_down = recent_20[recent_20['close'] < recent_20['open']]['volume'].sum()
-    if vol_up > vol_down * 1.8 and curr["CMF"] > 0: patterns.append("🟥红肥绿瘦")
-    if curr["volume"] < df["volume"].tail(100).min() * 1.2 and current_pos < 0.2: patterns.append("💤地量见地价")
-    if (prev['close'] < prev['open']) and (curr['close'] > curr['open']) and (curr['close'] > prev['open']) and (curr['volume'] > prev['volume']):
+    if vol_up > vol_down * 1.3: patterns.append("🟥红肥绿瘦")
+    
+    # N字反包
+    if (prev['close'] < prev['open']) and (curr['close'] > curr['open']) and (curr['close'] > prev['open']):
         patterns.append("⚡N字反包")
-    recent_5 = df.tail(5)
-    if (recent_5['close'] > recent_5['MA5']).all() and (recent_5['close'].iloc[-1] > recent_5['close'].iloc[0]):
-        patterns.append("🐜蚂蚁上树")
+    
     pattern_str = " ".join(patterns)
 
     # 背离与状态
     div_signal = ""
     if curr["low"] == df["low"].tail(20).min():
-        if curr["MACD_Bar"] > prev["MACD_Bar"] and curr["MACD_Bar"] < 0: div_signal = "💪MACD底背离"
+        if curr["MACD_Bar"] > prev["MACD_Bar"]: div_signal = "💪MACD底背离"
 
     macd_gold = (prev["DIF"] < prev["DEA"]) and (curr["DIF"] > curr["DEA"])
     macd_status = ""
     if macd_gold: macd_status = "🔥确认金叉"
-    elif curr["DIF"] > curr["DEA"] and curr["DIF"] > 0 and curr["MACD_Bar"] > prev["MACD_Bar"]: macd_status = "⛽空中加油"
+    elif curr["DIF"] > curr["DEA"] and curr["DIF"] > 0: macd_status = "⛽多头趋势"
     elif curr["DIF"] < curr["DEA"] and (curr["DEA"] - curr["DIF"]) < 0.05 and curr["MACD_Bar"] > prev["MACD_Bar"]: macd_status = "🔔即将金叉"
-    else: macd_status = "多头" if curr["DIF"] > curr["DEA"] else "空头"
 
     bb_state = ""
     if curr["BB_PctB"] > 1.0: bb_state = "🚀突破上轨"
     elif curr["BB_PctB"] < 0.0: bb_state = "📉跌破下轨"
-    elif curr["BB_Width"] < 10: bb_state = "↔️极度收口"
-    elif abs(curr["close"] - curr["BB_Mid"])/curr["BB_Mid"] < 0.015: bb_state = "🛡️中轨支撑"
+    elif curr["BB_Width"] < 15: bb_state = "↔️极度收口" # 放宽带宽
+    elif abs(curr["close"] - curr["BB_Mid"])/curr["BB_Mid"] < 0.02: bb_state = "🛡️中轨支撑"
 
-    # === 选股策略 ===
+    # === 选股策略 (恢复到宽容模式) ===
     signal_type = ""
     suggest_buy = curr["close"]
     stop_loss = curr["MA20"]
@@ -202,28 +212,27 @@ def process_stock_logic(df, code, name):
     
     # 策略1: 龙回头
     if has_zt and curr["close"] > curr["MA60"]:
-        if curr["volume"] < df["volume"].tail(30).max() * 0.5:
-            if -2.0 < curr["BIAS20"] < 6.0: 
-                signal_type = "🐉龙回头"
-                stop_loss = round(curr["BB_Lower"], 2)
-    # 策略2: 机构控盘
-    if not signal_type and curr["close"] > curr["MA60"] and ma60_slope:
-        if curr["CMF"] > 0.1 and curr["ADX"] > 25 and curr["BIAS20"] < 12.0:
+        if -5.0 < curr["BIAS20"] < 10.0: 
+            signal_type = "🐉龙回头"
+            stop_loss = round(curr["BB_Lower"], 2)
+    # 策略2: 机构控盘 (放宽)
+    if not signal_type and curr["close"] > curr["MA60"]:
+        if curr["CMF"] > 0.05 and curr["ADX"] > 20: # 门槛降回正常值
             signal_type = "🏦机构控盘"
             suggest_buy = round(curr["vwap"], 2)
     # 策略3: 极度超跌
-    if not signal_type and ((curr["RSI"] < 20) or div_signal):
+    if not signal_type and ((curr["RSI"] < 25) or div_signal): # 门槛降回25
         signal_type = "📉极度超跌"
         stop_loss = round(curr["low"] * 0.96, 2)
     # 策略4: 底部变盘
-    if not signal_type and curr["close"] < curr["MA60"] * 1.15 and curr["BB_Width"] < 10:
-         if macd_gold or curr["CMF"] > 0.15:
+    if not signal_type and curr["close"] < curr["MA60"] * 1.2:
+         if curr["BB_Width"] < 15:
             signal_type = "⚡底部变盘"
 
-    # === 风控与评分 ===
+    # === 🔥 核心修改：评分机制降级 ===
     obv_txt = "流入" if curr["OBV"] > curr["OBV_MA10"] else "流出"
-    if obv_txt == "流出": return None 
-
+    # 🔥 此次不再因为资金流出直接 return None，而是仅仅作为扣分项
+    
     score = 0
     reasons = []
     if signal_type: score += 1; reasons.append("策略")
@@ -239,7 +248,8 @@ def process_stock_logic(df, code, name):
         if hot in news_info: is_hot = True; break
     if is_hot: score += 1; reasons.append("热点")
 
-    if score < 2: return None
+    # 🔥 门槛降级：只要有1分就入选，保证有结果
+    if score < 1: return None
     
     resonance_str = "+".join(reasons)
     vol_ma5 = df["volume"].rolling(5).mean().iloc[-1]
@@ -283,7 +293,6 @@ def update_history(current_results):
         hist_df = pd.DataFrame(columns=["date", "code"])
 
     hist_df = hist_df[hist_df['date'] != today_str]
-
     sorted_dates = sorted(hist_df['date'].unique(), reverse=True)
     processed_results = []
     new_rows = []
@@ -294,31 +303,26 @@ def update_history(current_results):
         for d in sorted_dates:
             if not hist_df[(hist_df['date'] == d) & (hist_df['code'] == str(code))].empty:
                 streak += 1
-            else:
-                break
+            else: break
         
         streak_str = "首榜"
         if streak == 2: streak_str = "🔥2连板"
         elif streak >= 3: streak_str = f"🚀{streak}连板"
-        
         res['连续上榜'] = streak_str
         processed_results.append(res)
         new_rows.append({"date": today_str, "code": str(code)})
 
     if new_rows:
         hist_df = pd.concat([hist_df, pd.DataFrame(new_rows)], ignore_index=True)
-
     try:
         hist_df.to_csv(HISTORY_FILE, index=False)
-        print(f"✅ 历史记录已更新 (已自动去重): {HISTORY_FILE}")
     except: pass
-
     return processed_results
 
-# --- 4. Excel 美化 ---
+# --- Excel 输出 ---
 def save_and_beautify(data_list):
     dt_str = datetime.now().strftime("%Y%m%d_%H%M")
-    filename = f"严选_安全极速版_{dt_str}.xlsx"
+    filename = f"严选_平衡版_{dt_str}.xlsx"
     
     if not data_list:
         pd.DataFrame([["无结果"]]).to_excel(filename)
@@ -327,8 +331,7 @@ def save_and_beautify(data_list):
     df = pd.DataFrame(data_list)
     cols = ["代码", "名称", "现价", "今日涨跌", "连续上榜", "共振因子", "信号类型", "题材与利好", 
             "筹码分布", "形态特征", "MACD预警", "底背离", 
-            "布林状态", "BIAS%", 
-            "CMF指标", "RSI指标", "J值",
+            "布林状态", "BIAS%", "CMF指标", "RSI指标", "J值",
             "资金流向", "建议挂单", "止损价", "量比"]
     
     for c in cols:
@@ -397,10 +400,12 @@ def save_and_beautify(data_list):
             if rsi_val < 20: row[15].font = font_green; row[15].fill = fill_yellow
             elif rsi_val > 80: row[15].font = font_red
 
-        j_val = row[16].value
-        if isinstance(j_val, (int, float)):
-            if j_val < 0: row[16].font = font_green; row[16].fill = fill_yellow
-            elif j_val > 100: row[16].font = font_red
+        # 🔥 资金流向高亮修正
+        flow_cell = row[17]
+        if "流入" in str(flow_cell.value):
+            flow_cell.font = font_red
+        else:
+            flow_cell.font = font_green
 
     ws.column_dimensions['H'].width = 45 
     
@@ -409,8 +414,12 @@ def save_and_beautify(data_list):
     sub_title_font = Font(name='微软雅黑', size=11, bold=True, color="000000")
     text_font = Font(name='微软雅黑', size=10)
     
-    ws.cell(row=start_row, column=1, value="📘 严选策略实战指南").font = title_font
+    ws.cell(row=start_row, column=1, value="📘 平衡版选股指南").font = title_font
     start_row += 1
+    ws.cell(row=start_row, column=1, value="💡 说明：").font = Font(bold=True)
+    ws.cell(row=start_row, column=2, value="此版本为【保证结果版】。条件已放宽，资金流出不直接过滤，请人工参考[资金流向]列。").font = text_font
+    start_row += 1
+    
     strategies = [
         ("【🔥 连续上榜】", "含义：该股连续多日入选。2连板=确认走强；3连板=妖股气质。重点关注！"),
         ("【🐉 龙回头】", "逻辑：前期妖股+生命线支撑+极致缩量。操作：低吸博反抽。"),
@@ -421,27 +430,6 @@ def save_and_beautify(data_list):
     for title, desc in strategies:
         ws.cell(row=start_row, column=1, value=title).font = Font(bold=True)
         ws.cell(row=start_row, column=2, value=desc).font = text_font
-        start_row += 1
-
-    start_row += 1
-    ws.cell(row=start_row, column=1, value="📖 核心释义字典").font = title_font
-    start_row += 1
-    dictionary = [
-        ("【CMF指标】", "资金流量。>0代表资金流入，>0.1代表主力强控盘(红粗)。负值代表流出。"),
-        ("【RSI指标】", "相对强弱。20以下为超卖(底)，80以上为超买(顶)。"),
-        ("【J值】", "KDJ灵敏线。小于0代表极度超跌，随时可能反弹。"),
-        ("【今日涨跌】", "红色代表今日上涨，绿色代表下跌。"),
-        ("【共振因子】", "显示该股满足的核心条件。满足条件越多，确定性越高。"),
-        ("【筹码分布】", "🏆低位单峰密集：主力吸筹完成，极度稀缺的牛股形态。"),
-        ("【形态特征】", "🟥红肥绿瘦：资金运作；⚡N字反包：强势洗盘。"),
-        ("【MACD预警】", "🔔即将金叉：鸭子张嘴(左侧)；⛽空中加油：上涨中继。"),
-        ("【布林状态】", "↔️极度收口：变盘前兆；🚀突破上轨：主升浪。"),
-        ("【止损价】", "⛔ 跌破此价格必须无条件卖出！")
-    ]
-    for title, desc in dictionary:
-        ws.cell(row=start_row, column=1, value=title).font = sub_title_font
-        ws.cell(row=start_row, column=2, value=desc).font = text_font
-        ws.cell(row=start_row, column=2).alignment = Alignment(wrap_text=True)
         start_row += 1
 
     wb.save(filename)
@@ -457,7 +445,7 @@ def analyze_one_stock(code, name, start_dt):
     except: return None
 
 def main():
-    print("=== A股共振严选 (安全极速版) ===")
+    print("=== A股共振严选 (数据修复+平衡版) ===")
     get_market_hot_spots()
     start_time = time.time()
     targets, source_name = get_targets_robust()
@@ -469,25 +457,22 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
         future_to_stock = {executor.submit(analyze_one_stock, r['code'], r['name'], start_dt): r['code'] for _, r in targets.iterrows()}
         count = 0
+        total = len(targets)
         for future in concurrent.futures.as_completed(future_to_stock):
             count += 1
-            if count % 100 == 0: print(f"进度: {count}/{len(targets)} ...")
+            if count % 100 == 0: print(f"进度: {count}/{total} ...")
             try:
                 res = future.result()
                 if res:
-                    print(f"  ★ 严选: {res['名称']} {res['今日涨跌']} [{res['共振因子']}]")
+                    print(f"  ★ 选中: {res['名称']} {res['今日涨跌']} [{res['共振因子']}]")
                     results.append(res)
             except: pass
 
     if results:
-        print("\n正在处理历史记录与去重...")
         results = update_history(results)
     
-    print(f"\n耗时: {int(time.time() - start_time)}秒 | 严选出 {len(results)} 只精品")
+    print(f"\n耗时: {int(time.time() - start_time)}秒 | 选中 {len(results)} 只")
     save_and_beautify(results)
-    
-    if not any(f.endswith('.xlsx') for f in os.listdir('.')):
-        pd.DataFrame([["无"]]).to_excel(f"保底_{datetime.now().strftime('%H%M')}.xlsx")
 
 if __name__ == "__main__":
     main()
