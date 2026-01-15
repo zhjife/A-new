@@ -11,6 +11,7 @@ import time
 import sys
 import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.formatting.rule import ColorScaleRule
 import concurrent.futures
 import random
 
@@ -19,7 +20,7 @@ current_dir = os.getcwd()
 sys.path.append(current_dir)
 
 CONFIG = {
-    "MIN_AMOUNT": 20000000,   # 最低成交额 2000万
+    "MIN_AMOUNT": 20000000,   # 最低成交额
     "MIN_PRICE": 2.5,         # 最低股价
     "MAX_WORKERS": 12,        # 线程数
     "DAYS_LOOKBACK": 150      # 回溯天数
@@ -62,6 +63,7 @@ def get_targets_robust():
         return pd.DataFrame(), "无结果"
 
 def get_data_with_retry(code, start_date):
+    """获取日线数据"""
     time.sleep(random.uniform(0.01, 0.05))
     for _ in range(2):
         try:
@@ -72,12 +74,17 @@ def get_data_with_retry(code, start_date):
     return None
 
 def get_60m_data(code):
-    """获取60分钟K线数据"""
+    """
+    🔥 [修复] 获取60分钟K线数据
+    使用专门的分钟级接口 stock_zh_a_hist_min_em
+    """
     try:
-        df = ak.stock_zh_a_hist(symbol=code, period="60", adjust="qfq", timeout=5)
+        # period='60' 代表60分钟级别
+        df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq")
         if df is None or df.empty: return None
-        return df.tail(100)
-    except: return None
+        return df.tail(100) # 只取最近100根，提高计算速度
+    except:
+        return None
 
 def get_stock_catalysts(code):
     try:
@@ -141,7 +148,7 @@ def process_stock_logic(df, code, name):
     prev = df.iloc[-2]
     prev_2 = df.iloc[-3]
 
-    # --- 日线严选过滤 (Fail Fast) ---
+    # --- 必杀过滤 (Fail Fast) ---
     if curr["J"] > 100: return None
     if curr["OBV"] <= curr["OBV_MA10"]: return None
     if curr["CMF"] <= prev["CMF"] or curr["CMF"] < 0.02: return None
@@ -184,7 +191,6 @@ def process_stock_logic(df, code, name):
     vol_down = recent_20[recent_20['close'] < recent_20['open']]['volume'].sum()
     if vol_up > vol_down * 2.0 and curr["close"] > curr["MA20"]: patterns.append("🟥红肥绿瘦")
     if (prev['close'] < prev['open']) and (curr['close'] > curr['open']) and (curr['close'] > prev['open']): patterns.append("⚡N字反包")
-    # 蚂蚁上树
     recent_5 = df.tail(5)
     if (recent_5['close'] > recent_5['MA5']).all() and (recent_5['pct_chg'].abs() < 4.0).all() and (recent_5['close'].iloc[-1] > recent_5['close'].iloc[0]):
         patterns.append("🐜蚂蚁上树")
@@ -197,26 +203,32 @@ def process_stock_logic(df, code, name):
     if signal_type != "⚱️黄金坑(企稳)":
         if not (is_macd_gold or is_kdj_gold): return None
 
-    # --- 最终入围检查 ---
+    # --- 最终入围 ---
     has_strategy = bool(signal_type)
     has_resonance = bool(chip_signal and pattern_str) 
     if not (has_strategy or has_resonance): return None
 
     # ================================
-    # 🔥 60分钟级别 深度扫描
+    # 🔥 60分钟级别 深度扫描 (已修复接口)
     # ================================
     status_60m = "⏳数据不足"
     try:
+        # 使用 stock_zh_a_hist_min_em 获取分钟数据
         df_60 = get_60m_data(code)
+        
         if df_60 is not None and len(df_60) > 30:
-            rename_60 = {"开盘":"open","收盘":"close","最高":"high","最低":"low","成交量":"volume"}
+            # 清洗60分钟数据 (接口返回列名为中文)
+            rename_60 = {"时间":"date", "开盘":"open","收盘":"close","最高":"high","最低":"low","成交量":"volume"}
             col_map_60 = {k:v for k,v in rename_60.items() if k in df_60.columns}
             df_60.rename(columns=col_map_60, inplace=True)
             
             close_60 = df_60["close"]
+            # 计算 60m MACD
             macd_60 = MACD(close_60)
             dif_60 = macd_60.macd()
             dea_60 = macd_60.macd_signal()
+            
+            # 计算 60m 均线
             ma20_60 = close_60.rolling(20).mean()
             
             c60 = close_60.iloc[-1]
@@ -226,13 +238,15 @@ def process_stock_logic(df, code, name):
             dif_60_prev = dif_60.iloc[-2]
             dea_60_prev = dea_60.iloc[-2]
             
+            # 判定逻辑
             is_gold_60 = (dif_60_prev < dea_60_prev) and (dif_60_curr > dea_60_curr)
             
             if is_gold_60: status_60m = "✅60分金叉"
             elif dif_60_curr > dea_60_curr and c60 > ma20_60_curr: status_60m = "🚀60分多头"
             elif dif_60_curr < dea_60_curr: status_60m = "⚠️60分回调"
             else: status_60m = "⚪60分震荡"
-    except: status_60m = "❌获取失败"
+    except: 
+        status_60m = "❌获取失败"
 
     # --- 组装 ---
     cross_status = ""
@@ -284,6 +298,41 @@ def process_stock_logic(df, code, name):
         "止损价": stop_loss
     }
 
+# --- 🔥 加权评分排序系统 ---
+def calculate_total_score(row):
+    score = 0
+    # 1. 短线择时 (60分钟状态 - 权重最高)
+    s60 = str(row.get('60分状态', ''))
+    if "金叉" in s60: score += 100    
+    elif "多头" in s60: score += 80   
+    elif "震荡" in s60: score += 50
+    elif "回调" in s60: score += 20   
+    
+    # 2. 连续性
+    streak = str(row.get('连续', ''))
+    if "3连" in streak or "4连" in streak: score += 50
+    elif "2连" in streak: score += 30
+    else: score += 10 
+    
+    # 3. 资金动能
+    try:
+        c1 = float(row.get('今日CMF', 0))
+        c2 = float(row.get('昨日CMF', 0))
+        c3 = float(row.get('前日CMF', 0))
+        if c1 > c2 > c3: score += 30 
+        elif c1 > c2: score += 10
+        score += c1 * 10 
+    except: pass
+    
+    # 4. 核心加分项
+    if "黄金坑" in str(row.get('信号类型', '')): score += 20
+    if "双金叉" in str(row.get('金叉信号', '')): score += 15
+    if "筹码密集" in str(row.get('筹码分布', '')): score += 15
+    if "空中加油" in str(row.get('MACD状态', '')): score += 10
+    if "🔥" in str(row.get('热门概念', '')): score += 10
+    
+    return score
+
 # --- 历史与输出 ---
 def update_history(current_results):
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -316,14 +365,16 @@ def update_history(current_results):
 
 def save_and_beautify(data_list):
     dt_str = datetime.now().strftime("%Y%m%d_%H%M")
-    filename = f"严选_全攻略版_{dt_str}.xlsx"
+    filename = f"智能排名版_{dt_str}.xlsx"
     
     if not data_list:
         pd.DataFrame([["无股入选 (条件严苛)"]]).to_excel(filename)
         return filename
 
     df = pd.DataFrame(data_list)
-    cols = ["代码", "名称", "现价", "今日涨跌", "3日涨跌", "60分状态", "BIAS乖离", "连续", 
+    df["综合评分"] = df.apply(calculate_total_score, axis=1)
+    
+    cols = ["代码", "名称", "综合评分", "现价", "今日涨跌", "3日涨跌", "60分状态", "BIAS乖离", "连续", 
             "共振因子", "信号类型", "热门概念", "OBV状态", "今日CMF", "昨日CMF", "前日CMF", 
             "筹码分布", "形态特征", "MACD状态", "布林状态", "RSI指标", "J值", "建议挂单", "止损价"]
     
@@ -331,13 +382,12 @@ def save_and_beautify(data_list):
         if c not in df.columns: df[c] = ""
     df = df[cols]
     
-    df.sort_values(by=["60分状态", "连续", "今日CMF"], ascending=[False, False, False], inplace=True)
+    df.sort_values(by=["综合评分"], ascending=False, inplace=True)
     df.to_excel(filename, index=False)
     
     wb = openpyxl.load_workbook(filename)
     ws = wb.active
     
-    # 样式
     header_font = Font(name='微软雅黑', size=11, bold=True, color="FFFFFF")
     fill_blue = PatternFill("solid", fgColor="4472C4")
     font_red = Font(color="FF0000", bold=True)
@@ -350,93 +400,76 @@ def save_and_beautify(data_list):
         cell.font = header_font
     
     for row in ws.iter_rows(min_row=2):
-        for idx in [3, 4]: 
+        score_cell = row[2]
+        score_val = float(score_cell.value)
+        score_cell.font = Font(bold=True)
+        if score_val >= 150: score_cell.fill = PatternFill("solid", fgColor="FFC7CE") 
+        
+        for idx in [4, 5]: 
             val = str(row[idx].value)
             if "+" in val: row[idx].font = font_red
             elif "-" in val: row[idx].font = font_green
         
-        status_60 = str(row[5].value)
-        if "金叉" in status_60: row[5].font = font_red; row[5].fill = fill_yellow
-        elif "多头" in status_60: row[5].font = font_red
-        elif "回调" in status_60: row[5].font = font_green
+        status_60 = str(row[6].value)
+        if "金叉" in status_60: row[6].font = font_red; row[6].fill = fill_yellow
+        elif "多头" in status_60: row[6].font = font_red
+        elif "回调" in status_60: row[6].font = font_green
 
-        bias_val = row[6].value
+        bias_val = row[7].value
         if isinstance(bias_val, (int, float)):
-            if bias_val < -8: row[6].font = font_green; row[6].fill = fill_yellow
-            elif bias_val > 12: row[6].font = font_red
+            if bias_val < -8: row[7].font = font_green; row[7].fill = fill_yellow
+            elif bias_val > 12: row[7].font = font_red
 
-        if "连" in str(row[7].value): row[7].font = font_red; row[7].fill = fill_yellow
-        if "流入" in str(row[11].value): row[11].font = font_red
+        if "连" in str(row[8].value): row[8].font = font_red; row[8].fill = fill_yellow
+        if "流入" in str(row[12].value): row[12].font = font_red
+        if "红增" in str(row[18].value): row[18].font = font_red
         
-        if "红增" in str(row[17].value): row[17].font = font_red
-        elif "绿缩" in str(row[17].value): row[17].font = font_green
-
         try:
-            c_today = float(row[12].value)
-            c_prev = float(row[13].value)
-            c_prev2 = float(row[14].value)
-            row[12].font = font_red
-            if c_today > c_prev and c_prev > c_prev2:
-                row[12].fill = fill_yellow; row[13].font = font_red; row[14].font = font_red
+            c1, c2, c3 = float(row[13].value), float(row[14].value), float(row[15].value)
+            row[13].font = font_red
+            if c1 > c2 > c3:
+                row[13].fill = fill_yellow
+                row[14].font = font_red
+                row[15].font = font_red
         except: pass
 
-        if "蚂蚁" in str(row[16].value): row[16].font = font_purple
-        if "红肥" in str(row[16].value): row[16].font = font_red
+        if "蚂蚁" in str(row[17].value): row[17].font = font_purple
+        if "红肥" in str(row[17].value): row[17].font = font_red
 
-    ws.column_dimensions['F'].width = 15 
-    ws.column_dimensions['K'].width = 25 # 概念
+    ws.column_dimensions['G'].width = 15 
     
-    # ==========================================
-    # 📚 终极作战地图 (The Combat Map)
-    # ==========================================
     start_row = ws.max_row + 3
-    
-    # Fonts
     title_font = Font(name='微软雅黑', size=14, bold=True, color="FFFFFF")
     cat_font = Font(name='微软雅黑', size=12, bold=True, color="0000FF")
     text_font = Font(name='微软雅黑', size=10)
     
-    # --- 1. 五大策略实战手册 ---
-    ws.cell(row=start_row, column=1, value="⚔️ 五大策略实战手册 (Strategy Manual)").font = cat_font
+    ws.cell(row=start_row, column=1, value="🏆 智能排名逻辑说明").font = cat_font
     start_row += 1
-    
-    strategies = [
-        ("⚱️ 黄金坑", "【核心逻辑】深跌后首阳。要求：BIAS<-8(深跌) + 站上MA5 + 放量 + 绿柱缩短。", "【买入时机】收盘前半小时确认站稳MA5。止损：跌破前日最低价。"),
-        ("🐉 龙回头", "【核心逻辑】妖股首阴/首调。要求：前期涨停+缩量回踩生命线(MA60/MA20) + 资金未退。", "【买入时机】回踩建议挂单价位时低吸。止损：跌破布林下轨。"),
-        ("🏦 机构控盘", "【核心逻辑】主升浪。要求：CMF>0.1(强吸筹) + ADX趋势向上 + 均线多头排列。", "【买入时机】依托5日线或10日线低吸。只要CMF不转负可一直持有。"),
-        ("📉 极度超跌", "【核心逻辑】情绪错杀。要求：RSI<20 或 底背离，且资金未流出。", "【买入时机】左侧分批买入。反弹5-10%触及压力位即止盈。"),
-        ("⚡ 底部变盘", "【核心逻辑】方向选择。要求：布林带宽<12(极度收口) + 资金异动。", "【买入时机】放量突破布林上轨瞬间追击。止损：跌破布林中轨。")
+    guides = [
+        ("【综合评分】", "系统根据[择时+资金+趋势+共振]自动打分，分数越高越好。>150分为极品(粉色底)。"),
+        ("【排名逻辑】", "1. 60分金叉/多头优先；2. 3日连增资金优先；3. 连续上榜优先。"),
+        ("【操作建议】", "优先关注表格前5名的股票。若前排股票处于'60分回调'状态，可等金叉再买；若为'60分金叉'，即刻关注。")
     ]
-    
+    for n, d in guides:
+        ws.cell(row=start_row, column=1, value=n).font = Font(bold=True)
+        ws.cell(row=start_row, column=2, value=d).font = text_font
+        ws.merge_cells(start_row=start_row, start_column=2, end_row=start_row, end_column=10)
+        start_row += 1
+
+    ws.cell(row=start_row, column=1, value="⚔️ 五大策略实战手册").font = cat_font
+    start_row += 1
+    strategies = [
+        ("⚱️ 黄金坑", "【核心逻辑】深跌(BIAS<-8)后，今日放量阳线站稳MA5。左侧反转第一天。", "【操作】现价买入。止损设在前日最低点。"),
+        ("🐉 龙回头", "【核心逻辑】前期妖股回调至生命线(MA60/MA20)附近，极致缩量。", "【操作】在'建议挂单'价位低吸。跌破布林下轨止损。"),
+        ("🏦 机构控盘", "【核心逻辑】CMF>0.1(强吸筹) + ADX趋势向上 + 均线多头。", "【操作】沿5日线/10日线持股。"),
+        ("📉 极度超跌", "【核心逻辑】RSI<20 或 底背离，且资金未流出。", "【操作】左侧分批买入，反弹5-10%即止盈。"),
+        ("⚡ 底部变盘", "【核心逻辑】布林带宽<12(极度收口) + 资金异动。", "【操作】放量突破布林上轨瞬间追击。")
+    ]
     for name, logic, action in strategies:
         ws.cell(row=start_row, column=1, value=name).font = Font(bold=True)
         ws.cell(row=start_row, column=2, value=logic).font = text_font
         ws.cell(row=start_row, column=3, value=action).font = text_font
-        # 合并单元格让显示更整齐
-        ws.merge_cells(start_row=start_row, start_column=3, end_row=start_row, end_column=8)
-        start_row += 1
-        
-    start_row += 1
-    
-    # --- 2. 全指标读图指南 ---
-    ws.cell(row=start_row, column=1, value="📊 全指标读图指南 (Reading Guide)").font = cat_font
-    start_row += 1
-    
-    indicators = [
-        ("60分状态", "✅金叉(黄底)：日内最佳买点；🚀多头(红字)：持股/顺势买；⚠️回调(绿字)：日线好但短线跌，建议等金叉再买。"),
-        ("CMF三日", "资金流向指标。若[前<昨<今]且标黄，代表主力不计成本加速抢筹，爆发力最强。"),
-        ("BIAS乖离", "<-8% (绿黄底)：黄金坑区域，机会大； >12% (红字)：短线超买，谨防回调。"),
-        ("MACD状态", "🔴红增：多头增强；🟢绿缩：空头衰竭；⛽空中加油：上涨中继(强)。"),
-        ("形态特征", "🟥红肥绿瘦：倍量吸筹；🐜蚂蚁上树：温和建仓；⚡N字反包：强势洗盘。"),
-        ("共振因子", "显示该股满足的核心条件(如 策略+热点+双金叉)。满足越多，确定性越高。"),
-        ("建议挂单", "系统计算出的支撑位。切勿追高，挂单等待成交，成交不了也不亏。"),
-        ("止损价", "⛔ 风控铁律！收盘价跌破此价格，说明逻辑破坏，必须无条件卖出。")
-    ]
-    
-    for name, desc in indicators:
-        ws.cell(row=start_row, column=1, value=name).font = Font(bold=True)
-        ws.cell(row=start_row, column=2, value=desc).font = text_font
-        ws.merge_cells(start_row=start_row, start_column=2, end_row=start_row, end_column=8)
+        ws.merge_cells(start_row=start_row, start_column=3, end_row=start_row, end_column=10)
         start_row += 1
 
     wb.save(filename)
@@ -451,7 +484,7 @@ def analyze_one_stock(code, name, start_dt):
     except: return None
 
 def main():
-    print("=== A股严选 (全攻略·作战地图版) ===")
+    print("=== A股严选 (智能评分排名版) ===")
     get_market_hot_spots()
     start_time = time.time()
     targets, source_name = get_targets_robust()
@@ -470,7 +503,7 @@ def main():
             try:
                 res = future.result()
                 if res:
-                    print(f"  ★ 严选: {res['名称']} [{res['信号类型']}] BIAS:{res['BIAS乖离']}")
+                    print(f"  ★ 严选: {res['名称']} [{res['信号类型']}]")
                     results.append(res)
             except: pass
 
