@@ -2,12 +2,12 @@ name: Stock Scan with (加机构)
 
 on:
   workflow_dispatch:        # 允许你手动点击运行
-  schedule:
+ # schedule:
     # 这里的设置决定了自动运行的时间
     # GitHub 使用的是 UTC 时间 (比北京时间慢8小时)
     # 我们想要：北京时间 18:30 (收盘后数据稳的时候)
     # 换算为 UTC：18:30 - 8小时 = 10:30
-    - cron: '0 9 * * 1-5'
+   # - cron: '0 9 * * 1-5'
 jobs:
   run_scan:
     runs-on: ubuntu-latest
